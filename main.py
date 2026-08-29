@@ -1,4 +1,8 @@
+import os
 import asyncio
+import random
+import re
+from collections import Counter
 from datetime import datetime, timedelta
 
 import discord
@@ -8,54 +12,90 @@ from discord.ext import commands
 
 # ================= НАСТРОЙКИ =================
 
-# ВСТАВЬ СЮДА НОВЫЙ ТОКЕН ПОСЛЕ RESET TOKEN
-TOKEN = ""
+# На Bothost добавь переменную окружения:
+# DISCORD_TOKEN = твой_новый_токен
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-# ID канала, куда бот будет отправлять уведомления и карточки стрел
+if not TOKEN:
+    raise RuntimeError(
+        "Не найдена переменная окружения DISCORD_TOKEN."
+    )
+
+# ID канала, в который бот отправляет стрелы,
+# уведомления и случайные фразы
 CHANNEL_ID = 1543007392315474080
 
-# ID пользователей, которые могут создавать и управлять стрелами
+# ID администраторов.
+# Им доступны: /slot, /dstrel, /dslot, /addslot
 ADMIN_IDS = [
     1416863224430596107,
 ]
 
-# За сколько минут до начала стрелы публиковать уведомление и карточку
+# За сколько минут до начала стрелы появятся @everyone и карточка
 NOTIFICATION_BEFORE_MINUTES = 30
+
+# Через сколько бот может написать случайную фразу
+MIN_CHAT_DELAY_SECONDS = 30 * 60
+MAX_CHAT_DELAY_SECONDS = 60 * 60
 
 # ===============================================
 
 
 intents = discord.Intents.default()
 
+# Нужно для чтения текста сообщений участников
+intents.message_content = True
+
 bot = commands.Bot(
     command_prefix="!",
     intents=intents
 )
 
-# Уже опубликованные активные стрелы:
-# {message_id: {"data": ..., "view": ..., "message": ...}}
+# Активные опубликованные стрелы
 active_raids = {}
 
-# Последняя опубликованная стрела.
-# Через неё работают /dslot и /addslot.
-last_raid_message_id = None
-
-# Запланированные стрелы:
-# {номер: {"data": ..., "start_time": ..., "publish_time": ..., "task": ...}}
+# Запланированные стрелы
 scheduled_raids = {}
 
-# Следующий номер запланированной стрелы
+# Последняя опубликованная стрела
+last_raid_message_id = None
+
+# Номер следующей стрелы
 next_schedule_id = 1
 
+# Счётчики популярных слов и фраз
+word_counts = Counter()
+phrase_counts = Counter()
 
-# ================= ВАРИАНТЫ ВЫБОРА =================
+
+# ================= ВЫБОРЫ В /slot =================
 
 
 SERVER_CHOICES = [
+    app_commands.Choice(name="04 Chandler", value="04 Chandler"),
     app_commands.Choice(name="12 Glendale", value="12 Glendale"),
     app_commands.Choice(name="15 Payson", value="15 Payson"),
     app_commands.Choice(name="16 Gilbert", value="16 Gilbert"),
     app_commands.Choice(name="23 Holiday", value="23 Holiday"),
+]
+
+FACTION_CHOICES = [
+    app_commands.Choice(name="RM", value="RM"),
+    app_commands.Choice(name="LCN", value="LCN"),
+    app_commands.Choice(name="TRB", value="TRB"),
+    app_commands.Choice(name="YKZ", value="YKZ"),
+    app_commands.Choice(name="WMC", value="WMC"),
+]
+
+SIDE_CHOICES = [
+    app_commands.Choice(name="Attack", value="Attack"),
+    app_commands.Choice(name="Deff", value="Deff"),
+]
+
+WEAPON_CHOICES = [
+    app_commands.Choice(name="Deagle", value="Deagle"),
+    app_commands.Choice(name="Shotgun", value="Shotgun"),
+    app_commands.Choice(name="Rifla", value="Rifla"),
 ]
 
 FORMAT_CHOICES = [
@@ -95,12 +135,6 @@ def is_admin(user: discord.abc.User) -> bool:
 
 
 def parse_format(format_text: str) -> int:
-    """
-    2x2 = 2 основных слота
-    3x3 = 3 основных слота
-    4x4 = 4 основных слота
-    5x5 = 5 основных слотов
-    """
     formats = {
         "2x2": 2,
         "3x3": 3,
@@ -119,12 +153,6 @@ def parse_format(format_text: str) -> int:
 
 
 def get_start_datetime(time_text: str) -> datetime:
-    """
-    Создаёт дату начала стрелы по времени формата ЧЧ:ММ.
-
-    Если выбранное время уже прошло сегодня,
-    стрелу планируем на завтра.
-    """
     hours_text, minutes_text = time_text.split(":")
 
     hours = int(hours_text)
@@ -132,17 +160,44 @@ def get_start_datetime(time_text: str) -> datetime:
 
     now = datetime.now()
 
-    start_datetime = now.replace(
+    start_time = now.replace(
         hour=hours,
         minute=minutes,
         second=0,
         microsecond=0
     )
 
-    if start_datetime <= now:
-        start_datetime += timedelta(days=1)
+    if start_time <= now:
+        start_time += timedelta(days=1)
 
-    return start_datetime
+    return start_time
+
+
+def clean_chat_text(text: str) -> str:
+    text = text.lower().strip()
+
+    # Убираем ссылки
+    text = re.sub(
+        r"https?://\S+|www\.\S+",
+        "",
+        text
+    )
+
+    # Убираем упоминания пользователей, ролей и каналов
+    text = re.sub(
+        r"<@!?\d+>|<@&\d+>|<#\d+>",
+        "",
+        text
+    )
+
+    # Убираем лишние пробелы
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    return text
 
 
 def build_embed(data: dict) -> discord.Embed:
@@ -170,6 +225,24 @@ def build_embed(data: dict) -> discord.Embed:
     embed.add_field(
         name="Время начала",
         value=data["time"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="Против",
+        value=data["faction"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="Сторона",
+        value=data["side"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="Оружие",
+        value=data["weapon"],
         inline=True
     )
 
@@ -204,18 +277,14 @@ class RaidView(ui.View):
 
         self.data = data
         self.message = None
-
-        # Не даёт двум игрокам одновременно занять последнее место
         self.lock = asyncio.Lock()
 
     async def update_message(self):
-        if self.message is None:
-            return
-
-        await self.message.edit(
-            embed=build_embed(self.data),
-            view=self
-        )
+        if self.message is not None:
+            await self.message.edit(
+                embed=build_embed(self.data),
+                view=self
+            )
 
     @ui.button(
         label="Взять основной слот",
@@ -237,25 +306,42 @@ class RaidView(ui.View):
                 )
                 return
 
-            if user_id in self.data["reserve"]:
+            if len(self.data["main"]) >= self.data["slots_total"]:
                 await interaction.response.send_message(
-                    "Ты уже в резерве. Сначала покинь резерв.",
+                    "Основные слоты заполнены. Можешь записаться в резерв.",
                     ephemeral=True
                 )
                 return
 
-            if len(self.data["main"]) >= self.data["slots_total"]:
-                await interaction.response.send_message(
-                    "Основные слоты заполнены. "
-                    "Можешь записаться в резерв.",
-                    ephemeral=True
-                )
-                return
+            was_in_reserve = user_id in self.data["reserve"]
+
+            # Если игрок был в резерве — автоматически удаляем его оттуда
+            if was_in_reserve:
+                self.data["reserve"].remove(user_id)
 
             self.data["main"].append(user_id)
 
-            await interaction.response.defer()
+            slot_number = len(self.data["main"])
+
+            await interaction.response.defer(ephemeral=True)
             await self.update_message()
+
+            if was_in_reserve:
+                text = (
+                    f"✅ Ты успешно переведён из резерва в основу.\n"
+                    f"Твой номер основного слота: **{slot_number}**.\n"
+                    f"Покинуть слот можно кнопкой **«Покинуть слот»**."
+                )
+            else:
+                text = (
+                    f"✅ Ты успешно взял основной слот №**{slot_number}**.\n"
+                    f"Покинуть слот можно кнопкой **«Покинуть слот»**."
+                )
+
+            await interaction.followup.send(
+                text,
+                ephemeral=True
+            )
 
     @ui.button(
         label="Взять резерв",
@@ -293,8 +379,16 @@ class RaidView(ui.View):
 
             self.data["reserve"].append(user_id)
 
-            await interaction.response.defer()
+            reserve_number = len(self.data["reserve"])
+
+            await interaction.response.defer(ephemeral=True)
             await self.update_message()
+
+            await interaction.followup.send(
+                f"✅ Ты успешно взял резервный слот №**{reserve_number}**.\n"
+                f"Покинуть слот можно кнопкой **«Покинуть слот»**.",
+                ephemeral=True
+            )
 
     @ui.button(
         label="Покинуть слот",
@@ -309,36 +403,37 @@ class RaidView(ui.View):
         user_id = interaction.user.id
 
         async with self.lock:
-            removed = False
-
             if user_id in self.data["main"]:
                 self.data["main"].remove(user_id)
-                removed = True
+                place = "основные слоты"
 
-            if user_id in self.data["reserve"]:
+            elif user_id in self.data["reserve"]:
                 self.data["reserve"].remove(user_id)
-                removed = True
+                place = "резерв"
 
-            if not removed:
+            else:
                 await interaction.response.send_message(
                     "Ты не записан в эту стрелу.",
                     ephemeral=True
                 )
                 return
 
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
             await self.update_message()
+
+            await interaction.followup.send(
+                f"✅ Ты успешно покинул {place}.",
+                ephemeral=True
+            )
 
 
 async def get_target_channel():
-    """
-    Находит текстовый канал из CHANNEL_ID.
-    """
     channel = bot.get_channel(CHANNEL_ID)
 
     if channel is None:
         try:
             channel = await bot.fetch_channel(CHANNEL_ID)
+
         except discord.DiscordException:
             return None
 
@@ -349,10 +444,6 @@ async def get_target_channel():
 
 
 async def publish_raid(schedule_id: int):
-    """
-    Ждёт до времени уведомления, затем отправляет @everyone
-    и карточку стрелы.
-    """
     global last_raid_message_id
 
     raid = scheduled_raids.get(schedule_id)
@@ -360,13 +451,13 @@ async def publish_raid(schedule_id: int):
     if raid is None:
         return
 
-    publish_time = raid["publish_time"]
-    seconds_to_wait = (publish_time - datetime.now()).total_seconds()
+    seconds_to_wait = (
+        raid["publish_time"] - datetime.now()
+    ).total_seconds()
 
     if seconds_to_wait > 0:
         await asyncio.sleep(seconds_to_wait)
 
-    # Стрела могла быть отменена во время ожидания
     raid = scheduled_raids.get(schedule_id)
 
     if raid is None:
@@ -377,17 +468,19 @@ async def publish_raid(schedule_id: int):
 
     if channel is None:
         print(
-            f"Не удалось отправить стрелу #{schedule_id}: "
-            "канал CHANNEL_ID не найден или недоступен."
+            f"Стрела #{schedule_id} не отправлена: канал недоступен."
         )
+
         scheduled_raids.pop(schedule_id, None)
         return
 
     try:
-        # Уведомление всем участникам за 30 минут до стрелы
         await channel.send(
             f"@everyone 🏹 Через {NOTIFICATION_BEFORE_MINUTES} минут стрела!\n"
             f"Сервер: **{data['server']}**\n"
+            f"Против: **{data['faction']}**\n"
+            f"Сторона: **{data['side']}**\n"
+            f"Оружие: **{data['weapon']}**\n"
             f"Формат: **{data['format']}**\n"
             f"Время начала: **{data['time']}**",
 
@@ -398,7 +491,6 @@ async def publish_raid(schedule_id: int):
             )
         )
 
-        # Карточка со слотами
         view = RaidView(data)
 
         message = await channel.send(
@@ -416,27 +508,101 @@ async def publish_raid(schedule_id: int):
 
         last_raid_message_id = message.id
 
-        print(
-            f"Стрела #{schedule_id} опубликована: "
-            f"{data['server']} | {data['format']} | {data['time']}"
-        )
-
     except discord.Forbidden:
         print(
-            f"Не удалось отправить стрелу #{schedule_id}: "
-            "у бота нет прав на отправку сообщений или @everyone."
+            "У бота нет прав писать в канал "
+            "или упоминать @everyone."
         )
 
     except discord.HTTPException as error:
-        print(
-            f"Ошибка Discord при отправке стрелы #{schedule_id}: {error}"
-        )
+        print(f"Ошибка Discord: {error}")
 
     finally:
         scheduled_raids.pop(schedule_id, None)
 
 
-# ----------------- Slash-команда /slot -----------------
+async def random_chat_loop():
+    """
+    Раз в случайный промежуток от 30 до 60 минут
+    бот отправляет популярную фразу или слово.
+    """
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        delay = random.randint(
+            MIN_CHAT_DELAY_SECONDS,
+            MAX_CHAT_DELAY_SECONDS
+        )
+
+        await asyncio.sleep(delay)
+
+        channel = await get_target_channel()
+
+        if channel is None:
+            continue
+
+        # В двух случаях из трёх выбираем фразу
+        if phrase_counts and random.choice([True, True, False]):
+            popular_phrases = [
+                phrase
+                for phrase, count in phrase_counts.most_common(30)
+            ]
+
+            phrase = random.choice(popular_phrases)
+
+            await channel.send(
+                f"💬 {phrase}",
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+        # Если фраз нет — выбираем популярное слово
+        elif word_counts:
+            popular_words = [
+                word
+                for word, count in word_counts.most_common(30)
+            ]
+
+            word = random.choice(popular_words)
+
+            await channel.send(
+                f"💬 {word}",
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+
+# ----------------- Отслеживание сообщений -----------------
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Не читаем личные сообщения и сообщения ботов
+    if message.guild is None or message.author.bot:
+        return
+
+    # Бот анализирует сообщения только в канале стрел
+    if message.channel.id == CHANNEL_ID:
+        text = clean_chat_text(message.content)
+
+        # Не запоминаем команды
+        if text and not text.startswith(("!", "/")):
+            words = re.findall(
+                r"[a-zа-яё0-9]{3,}",
+                text,
+                flags=re.IGNORECASE
+            )
+
+            # Считаем популярные отдельные слова
+            word_counts.update(words)
+
+            # Запоминаем короткие фразы:
+            # от 2 до 10 слов и максимум 120 символов
+            if 2 <= len(words) <= 10 and len(text) <= 120:
+                phrase_counts[text] += 1
+
+    await bot.process_commands(message)
+
+
+# ----------------- /slot -----------------
 
 
 @bot.tree.command(
@@ -445,26 +611,35 @@ async def publish_raid(schedule_id: int):
 )
 @app_commands.describe(
     server="Выбери сервер",
+    faction="Выбери фракцию противника",
+    side="Выбери Attack или Deff",
+    weapon="Выбери оружие",
     format="Выбери формат",
     time_str="Выбери время начала стрелы"
 )
 @app_commands.choices(
     server=SERVER_CHOICES,
+    faction=FACTION_CHOICES,
+    side=SIDE_CHOICES,
+    weapon=WEAPON_CHOICES,
     format=FORMAT_CHOICES,
     time_str=TIME_CHOICES
 )
 async def slot(
     interaction: Interaction,
     server: app_commands.Choice[str],
+    faction: app_commands.Choice[str],
+    side: app_commands.Choice[str],
+    weapon: app_commands.Choice[str],
     format: app_commands.Choice[str],
     time_str: app_commands.Choice[str]
 ):
     global next_schedule_id
 
-    # Создание расписания доступно только в ЛС
+    # Создание стрел только в ЛС
     if interaction.guild is not None:
         await interaction.response.send_message(
-            "Команду /slot используй в личных сообщениях с ботом.",
+            "Используй команду /slot в личных сообщениях с ботом.",
             ephemeral=True
         )
         return
@@ -487,13 +662,11 @@ async def slot(
         )
         return
 
-    # Карточка и уведомление появятся за 30 минут до начала
     publish_time = start_time - timedelta(
         minutes=NOTIFICATION_BEFORE_MINUTES
     )
 
-    # Нельзя опубликовать стрелу в прошлом.
-    # Если до начала осталось меньше 30 минут — публикуем сразу.
+    # Если до стрелы осталось меньше 30 минут — публикуем сразу
     if publish_time < datetime.now():
         publish_time = datetime.now()
 
@@ -502,6 +675,9 @@ async def slot(
 
     data = {
         "server": server.value,
+        "faction": faction.value,
+        "side": side.value,
+        "weapon": weapon.value,
         "format": format.value,
         "slots_total": slots_total,
         "time": time_str.value,
@@ -523,23 +699,20 @@ async def slot(
 
     scheduled_raids[schedule_id]["task"] = task
 
-    start_text = start_time.strftime("%d.%m.%Y %H:%M")
-    publish_text = publish_time.strftime("%d.%m.%Y %H:%M")
-
     await interaction.response.send_message(
         f"✅ Стрела #{schedule_id} запланирована.\n\n"
         f"Сервер: **{server.value}**\n"
+        f"Против: **{faction.value}**\n"
+        f"Сторона: **{side.value}**\n"
+        f"Оружие: **{weapon.value}**\n"
         f"Формат: **{format.value}**\n"
-        f"Начало стрелы: **{start_text}**\n"
-        f"Уведомление и слоты: **{publish_text}**\n"
-        f"Канал отправки: <#{CHANNEL_ID}>\n\n"
-        f"Посмотреть все стрелы: `/strels`\n"
-        f"Отменить стрелу: `/dstrel номер:{schedule_id}`",
+        f"Начало: **{start_time:%d.%m.%Y %H:%M}**\n"
+        f"Уведомление и слоты: **{publish_time:%d.%m.%Y %H:%M}**",
         ephemeral=True
     )
 
 
-# ----------------- Slash-команда /strels -----------------
+# ----------------- /strels -----------------
 
 
 @bot.tree.command(
@@ -547,25 +720,19 @@ async def slot(
     description="Показать все запланированные стрелы"
 )
 async def strels(interaction: Interaction):
-    # Управление расписанием — только в ЛС
-    if interaction.guild is not None:
+    # Нельзя использовать в ЛС
+    if interaction.guild is None:
         await interaction.response.send_message(
-            "Команду /strels используй в личных сообщениях с ботом.",
+            "Команду /strels нельзя использовать в личных сообщениях.",
             ephemeral=True
         )
         return
 
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "У тебя нет прав для просмотра расписания.",
-            ephemeral=True
-        )
-        return
-
+    # Команду может использовать любой участник сервера
     if not scheduled_raids:
         await interaction.response.send_message(
-            "Запланированных стрел нет.",
-            ephemeral=True
+            "📋 Сейчас нет запланированных стрел.",
+            ephemeral=False
         )
         return
 
@@ -577,18 +744,23 @@ async def strels(interaction: Interaction):
         publish_time = raid["publish_time"]
 
         lines.append(
-            f"**#{schedule_id}** — {data['server']} | "
-            f"{data['format']} | начало: **{start_time:%d.%m %H:%M}** | "
-            f"публикация: **{publish_time:%d.%m %H:%M}**"
+            f"**#{schedule_id}** — "
+            f"**{data['server']}** | "
+            f"против **{data['faction']}** | "
+            f"**{data['side']}** | "
+            f"оружие: **{data['weapon']}** | "
+            f"**{data['format']}** | "
+            f"начало: **{start_time:%d.%m %H:%M}** | "
+            f"слоты: **{publish_time:%d.%m %H:%M}**"
         )
 
     await interaction.response.send_message(
         "📋 **Запланированные стрелы:**\n\n" + "\n".join(lines),
-        ephemeral=True
+        ephemeral=False
     )
 
 
-# ----------------- Slash-команда /dstrel -----------------
+# ----------------- /dstrel -----------------
 
 
 @bot.tree.command(
@@ -602,10 +774,10 @@ async def dstrel(
     interaction: Interaction,
     number: int
 ):
-    # Управление расписанием — только в ЛС
+    # Отмена стрелы только в ЛС
     if interaction.guild is not None:
         await interaction.response.send_message(
-            "Команду /dstrel используй в личных сообщениях с ботом.",
+            "Используй команду /dstrel в личных сообщениях с ботом.",
             ephemeral=True
         )
         return
@@ -621,7 +793,7 @@ async def dstrel(
 
     if raid is None:
         await interaction.response.send_message(
-            f"Стрела #{number} не найдена или уже была опубликована.",
+            f"Стрела #{number} не найдена или уже опубликована.",
             ephemeral=True
         )
         return
@@ -631,20 +803,15 @@ async def dstrel(
     if task is not None and not task.done():
         task.cancel()
 
-    data = raid["data"]
-
     scheduled_raids.pop(number, None)
 
     await interaction.response.send_message(
-        f"❌ Стрела #{number} отменена.\n"
-        f"Сервер: **{data['server']}**\n"
-        f"Формат: **{data['format']}**\n"
-        f"Время: **{data['time']}**",
+        f"❌ Стрела #{number} отменена.",
         ephemeral=True
     )
 
 
-# ----------------- Slash-команда /dslot -----------------
+# ----------------- /dslot -----------------
 
 
 @bot.tree.command(
@@ -660,7 +827,6 @@ async def dslot(
 ):
     global last_raid_message_id
 
-    # В ЛС команду использовать нельзя
     if interaction.guild is None:
         await interaction.response.send_message(
             "Команду /dslot нельзя использовать в личных сообщениях.",
@@ -677,7 +843,7 @@ async def dslot(
 
     if last_raid_message_id is None:
         await interaction.response.send_message(
-            "Сейчас нет активной опубликованной стрелы.",
+            "Сейчас нет активной стрелы.",
             ephemeral=True
         )
         return
@@ -693,20 +859,15 @@ async def dslot(
 
     data = raid["data"]
     view = raid["view"]
-    user_id = user.id
 
     async with view.lock:
-        removed = False
+        if user.id in data["main"]:
+            data["main"].remove(user.id)
 
-        if user_id in data["main"]:
-            data["main"].remove(user_id)
-            removed = True
+        elif user.id in data["reserve"]:
+            data["reserve"].remove(user.id)
 
-        if user_id in data["reserve"]:
-            data["reserve"].remove(user_id)
-            removed = True
-
-        if not removed:
+        else:
             await interaction.response.send_message(
                 "Этот игрок не записан в слоты.",
                 ephemeral=True
@@ -722,7 +883,7 @@ async def dslot(
     )
 
 
-# ----------------- Slash-команда /addslot -----------------
+# ----------------- /addslot -----------------
 
 
 @bot.tree.command(
@@ -738,7 +899,6 @@ async def addslot(
 ):
     global last_raid_message_id
 
-    # В ЛС команду использовать нельзя
     if interaction.guild is None:
         await interaction.response.send_message(
             "Команду /addslot нельзя использовать в личных сообщениях.",
@@ -755,7 +915,7 @@ async def addslot(
 
     if last_raid_message_id is None:
         await interaction.response.send_message(
-            "Сейчас нет активной опубликованной стрелы.",
+            "Сейчас нет активной стрелы.",
             ephemeral=True
         )
         return
@@ -771,10 +931,9 @@ async def addslot(
 
     data = raid["data"]
     view = raid["view"]
-    user_id = user.id
 
     async with view.lock:
-        if user_id in data["main"]:
+        if user.id in data["main"]:
             await interaction.response.send_message(
                 "Этот игрок уже находится в основных слотах.",
                 ephemeral=True
@@ -783,17 +942,15 @@ async def addslot(
 
         if len(data["main"]) >= data["slots_total"]:
             await interaction.response.send_message(
-                "Основные слоты заполнены. "
-                "Сначала освободи место через /dslot.",
+                "Основные слоты заполнены.",
                 ephemeral=True
             )
             return
 
-        # Если игрок был в резерве, переносим его в основу
-        if user_id in data["reserve"]:
-            data["reserve"].remove(user_id)
+        if user.id in data["reserve"]:
+            data["reserve"].remove(user.id)
 
-        data["main"].append(user_id)
+        data["main"].append(user.id)
 
         await interaction.response.defer(ephemeral=True)
         await view.update_message()
@@ -812,16 +969,22 @@ async def on_ready():
     print(f"Бот готов: {bot.user}")
 
     await bot.change_presence(
-        status=discord.Status.online,
-        activity=discord.Activity(
-            name="Пикни слот на стрелу, чудище!",
-            type=discord.ActivityType.playing
+        activity=discord.Game(
+            name="Пикни слот на стрелу, чудище!"
         )
     )
 
     synced = await bot.tree.sync()
 
-    print(f"Синхронизировано slash-команд: {len(synced)}")
+    print(
+        f"Синхронизировано slash-команд: {len(synced)}"
+    )
+
+    # Запускаем болталку только один раз
+    if not hasattr(bot, "random_chat_task"):
+        bot.random_chat_task = asyncio.create_task(
+            random_chat_loop()
+        )
 
 
 @bot.event
